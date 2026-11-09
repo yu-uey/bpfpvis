@@ -66,11 +66,17 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 	return vfprintf(stderr, format, args);
 }
 
+enum colcolor {
+	CC_DEFAULT, /* to make useful pairs start at 1 */
+	CC_EXEC,
+	CC_EXIT,
+};
 struct column {
 	size_t len;
 	char *text;
 	int pos;
 	int ticks;
+	enum colcolor color;
 };
 
 struct context {
@@ -114,6 +120,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	c->cols[col].len = strlen(e->comm);
 	c->cols[col].pos = -1;
 	c->cols[col].ticks = 0;
+	c->cols[col].color = (e->exit_event) ? CC_EXIT : CC_EXEC;
 
 	return 0;
 }
@@ -123,6 +130,7 @@ void init_col(struct column *col) {
 	col->len = 0;
 	col->pos = -2;
 	col->ticks = 0;
+	col->color = CC_DEFAULT;
 }
 void reset_col(struct column *col) {
 	free(col->text);
@@ -135,6 +143,20 @@ void set_scrsz(struct context *ctx) {
 	ctx->cols = malloc(ctx->ncols * sizeof(struct column));
 	for (int i = 0; i < ctx->ncols; i++) {
 		init_col(&ctx->cols[i]);
+	}
+}
+
+void setup_display(struct context *ctx) {
+	initscr();
+	noecho();
+	cbreak();
+	curs_set(0);
+	set_scrsz(ctx);
+	if (has_colors()) {
+		start_color();
+		use_default_colors();
+		init_pair(CC_EXEC, COLOR_GREEN, -1); /* exec */
+		init_pair(CC_EXIT, COLOR_RED, -1); /* exit */
 	}
 }
 
@@ -155,10 +177,12 @@ void update_display(struct context *ctx) {
 			continue;
 		}
 
+		attron(COLOR_PAIR(col->color));
 		/* add bottom */
 		mvaddch(col->pos, x, col->text[col->pos % col->len]);
 		/* decay top */
 		mvaddch(col->pos - col->len, x, ' ');
+		attroff(COLOR_PAIR(col->color));
 	}
 }
 
@@ -216,11 +240,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Set up ncurses */
-	initscr();
-	noecho();
-	cbreak();
-	curs_set(0);
-	set_scrsz(&ctx);
+	setup_display(&ctx);
 
 	/* Process events */
 	while (!exiting) {
@@ -228,12 +248,12 @@ int main(int argc, char **argv)
 		err = ring_buffer__consume(rb);
 		/* Ctrl-C will cause -EINTR */
 		if (err == -EINTR) {
-					 err = 0;
-					 break;
+			err = 0;
+			break;
 		}
 		if (err < 0) {
-				printf("Error polling perf buffer: %d\n", err);
-				break;
+			printf("Error polling perf buffer: %d\n", err);
+			break;
 		}
 
 		update_display(&ctx);
