@@ -8,6 +8,7 @@
 #include <bpf/libbpf.h>
 #include "bootstrap.h"
 #include "bootstrap.skel.h"
+#include <ncurses.h>
 
 static struct env {
 	bool verbose;
@@ -65,6 +66,19 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 	return vfprintf(stderr, format, args);
 }
 
+struct column {
+	size_t len;
+	char *text;
+	int pos;
+	int ticks;
+};
+
+struct context {
+	int ncols;
+	int nrows;
+	struct column *cols;
+};
+
 static volatile bool exiting = false;
 
 static void sig_handler(int sig)
@@ -72,29 +86,80 @@ static void sig_handler(int sig)
 	exiting = true;
 }
 
+static int pick_column(const struct context *c) {
+	const int r = rand() % c->ncols;
+	for (int i = r; i < c->ncols; i++) {
+		if (c->cols[i].pos < -1) {
+			return i;
+		}
+	}
+	for (int i = 0; i < r; i++) {
+		if (c->cols[i].pos < -1) {
+			return i;
+		}
+	}
+	return -1;
+}
+
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
+	const struct context *c = ctx;
 	const struct event *e = data;
-	struct tm *tm;
-	char ts[32];
-	time_t t;
 
-	time(&t);
-	tm = localtime(&t);
-	strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+	int col = pick_column(c);
 
-	if (e->exit_event) {
-		printf("%-8s %-5s %-16s %-7d %-7d [%u]", ts, "EXIT", e->comm, e->pid, e->ppid,
-		       e->exit_code);
-		if (e->duration_ns)
-			printf(" (%llums)", e->duration_ns / 1000000);
-		printf("\n");
-	} else {
-		printf("%-8s %-5s %-16s %-7d %-7d %s\n", ts, "EXEC", e->comm, e->pid, e->ppid,
-		       e->filename);
-	}
+	if (col < 0) return 0;
+
+	c->cols[col].text = strdup(e->comm);
+	c->cols[col].len = strlen(e->comm);
+	c->cols[col].pos = -1;
+	c->cols[col].ticks = 0;
 
 	return 0;
+}
+
+void init_col(struct column *col) {
+	col->text = NULL;
+	col->len = 0;
+	col->pos = -2;
+	col->ticks = 0;
+}
+void reset_col(struct column *col) {
+	free(col->text);
+	init_col(col);
+}
+
+void set_scrsz(struct context *ctx) {
+	getmaxyx(stdscr, ctx->nrows, ctx->ncols);
+	free(ctx->cols);
+	ctx->cols = malloc(ctx->ncols * sizeof(struct column));
+	for (int i = 0; i < ctx->ncols; i++) {
+		init_col(&ctx->cols[i]);
+	}
+}
+
+void update_display(struct context *ctx) {
+	for (int x = 0; x < ctx->ncols; x++) {
+		struct column *col = &ctx->cols[x];
+
+		/* column not falling */
+		if (col->pos < -1) continue;
+
+		/* tick for update */
+		col->ticks ++;
+		if (col->ticks < 2) continue;
+		col->ticks = 0;
+		col->pos ++;
+		if (col->pos >= ctx->nrows + col->len) {
+			reset_col(col);
+			continue;
+		}
+
+		/* add bottom */
+		mvaddch(col->pos, x, col->text[col->pos % col->len]);
+		/* decay top */
+		mvaddch(col->pos - col->len, x, ' ');
+	}
 }
 
 int main(int argc, char **argv)
@@ -102,6 +167,9 @@ int main(int argc, char **argv)
 	struct ring_buffer *rb = NULL;
 	struct bootstrap_bpf *skel;
 	int err;
+
+	/* state for display */
+	struct context ctx = {0};
 
 	/* Parse command line arguments */
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
@@ -140,28 +208,39 @@ int main(int argc, char **argv)
 	}
 
 	/* Set up ring buffer polling */
-	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, NULL, NULL);
+	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, &ctx, NULL);
 	if (!rb) {
 		err = -1;
 		fprintf(stderr, "Failed to create ring buffer\n");
 		goto cleanup;
 	}
 
+	/* Set up ncurses */
+	initscr();
+	noecho();
+	cbreak();
+	curs_set(0);
+	set_scrsz(&ctx);
+
 	/* Process events */
-	printf("%-8s %-5s %-16s %-7s %-7s %s\n", "TIME", "EVENT", "COMM", "PID", "PPID",
-	       "FILENAME/EXIT CODE");
 	while (!exiting) {
-		err = ring_buffer__poll(rb, 100 /* timeout, ms */);
+		/* consume without waiting */
+		err = ring_buffer__consume(rb);
 		/* Ctrl-C will cause -EINTR */
 		if (err == -EINTR) {
-			err = 0;
-			break;
+					 err = 0;
+					 break;
 		}
 		if (err < 0) {
-			printf("Error polling perf buffer: %d\n", err);
-			break;
+				printf("Error polling perf buffer: %d\n", err);
+				break;
 		}
+
+		update_display(&ctx);
+		refresh();
+		napms(50);
 	}
+	endwin();
 
 cleanup:
 	/* Clean up */

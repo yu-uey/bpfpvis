@@ -19,6 +19,7 @@ VMLINUX := ../vmlinux.h/include/$(ARCH)/vmlinux.h
 # outdated
 INCLUDES := -I$(OUTPUT) -I../libbpf/include/uapi -I$(dir $(VMLINUX))
 CFLAGS := -g -Wall
+LDFLAGS := -lncurses
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
 
 APPS = bootstrap
