@@ -77,6 +77,7 @@ struct column {
 	int pos;
 	int ticks;
 	enum colcolor color;
+	pid_t pid;
 };
 
 struct context {
@@ -107,19 +108,36 @@ static int pick_column(const struct context *c) {
 	return -1;
 }
 
+static int find_column(const struct context *c, pid_t pid) {
+	for (int i = 0; i < c->ncols; i++) {
+		if (c->cols[i].pid == pid) {
+			return i;
+		}
+	}
+	return -1;
+}
+
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
 	const struct context *c = ctx;
 	const struct event *e = data;
+	int col;
 
-	int col = pick_column(c);
+	/* if column for pid exists, re-use that */
+	col = find_column(ctx, e->pid);
+	if (col < 0) {
+		/* if no matching PID, (try to) create a new column */
+		col = pick_column(c);
+		if (col < 0) return 0;
 
-	if (col < 0) return 0;
+		c->cols[col].pos = -1;
+		c->cols[col].ticks = 0;
+		c->cols[col].pid = e->pid;
+	}
 
+	/* these fields describe the process and are updated on exec */
 	c->cols[col].text = strdup(e->comm);
 	c->cols[col].len = strlen(e->comm);
-	c->cols[col].pos = -1;
-	c->cols[col].ticks = 0;
 	c->cols[col].color = (e->exit_event) ? CC_EXIT : CC_EXEC;
 
 	return 0;
@@ -131,10 +149,10 @@ void init_col(struct column *col) {
 	col->pos = -2;
 	col->ticks = 0;
 	col->color = CC_DEFAULT;
+	col->pid = -1;
 }
-void reset_col(struct column *col) {
+void free_col(struct column *col) {
 	free(col->text);
-	init_col(col);
 }
 
 void set_scrsz(struct context *ctx) {
@@ -173,7 +191,8 @@ void update_display(struct context *ctx) {
 		col->ticks = 0;
 		col->pos ++;
 		if (col->pos >= ctx->nrows + col->len) {
-			reset_col(col);
+			free_col(col);
+			init_col(col);
 			continue;
 		}
 
