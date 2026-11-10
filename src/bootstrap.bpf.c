@@ -22,17 +22,14 @@ struct {
 
 const volatile unsigned long long min_duration_ns = 0;
 
-SEC("tp/sched/sched_process_exec")
-int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
-{
-	struct task_struct *task;
-	unsigned fname_off;
+SEC("tp_btf/sched_process_exec")
+int BPF_PROG(handle_exec, struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm) {
 	struct event *e;
 	pid_t pid;
 	u64 ts;
 
 	/* remember time exec() was executed for this PID */
-	pid = bpf_get_current_pid_tgid() >> 32;
+	pid = p->tgid;
 	ts = bpf_ktime_get_ns();
 	bpf_map_update_elem(&exec_start, &pid, &ts, BPF_ANY);
 
@@ -46,15 +43,12 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 		return 0;
 
 	/* fill out the sample with data */
-	task = (struct task_struct *)bpf_get_current_task();
-
 	e->exit_event = false;
 	e->pid = pid;
-	e->ppid = BPF_CORE_READ(task, real_parent, tgid);
-	bpf_get_current_comm(&e->comm, sizeof(e->comm));
+	e->ppid = p->real_parent->tgid;
+	bpf_probe_read_kernel_str(&e->comm, sizeof(e->comm), p->comm);
 
-	fname_off = ctx->__data_loc_filename & 0xFFFF;
-	bpf_probe_read_str(&e->filename, sizeof(e->filename), (void *)ctx + fname_off);
+	bpf_probe_read_kernel_str(&e->filename, sizeof(e->filename), bprm->filename);
 
 	/* successfully submit it to user-space for post-processing */
 	bpf_ringbuf_submit(e, 0);
