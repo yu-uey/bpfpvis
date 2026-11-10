@@ -76,6 +76,7 @@ struct column {
 	char *text;
 	int pos;
 	int ticks;
+	int speed;
 	enum colcolor color;
 	pid_t pid;
 };
@@ -93,28 +94,38 @@ static void sig_handler(int sig)
 	exiting = true;
 }
 
-static int pick_column(const struct context *c) {
-	const int r = rand() % c->ncols;
-	for (int i = r; i < c->ncols; i++) {
-		if (c->cols[i].pos < -1) {
-			return i;
-		}
-	}
-	for (int i = 0; i < r; i++) {
-		if (c->cols[i].pos < -1) {
-			return i;
-		}
-	}
-	return -1;
-}
-
 static int find_column(const struct context *c, pid_t pid) {
+	/* try to find matching PID */
 	for (int i = 0; i < c->ncols; i++) {
 		if (c->cols[i].pid == pid) {
 			return i;
 		}
 	}
-	return -1;
+	/* otherwise, use random column */
+	int col = -1;
+	const int r = rand() % c->ncols;
+	for (int i = r; i < c->ncols; i++) {
+		if (c->cols[i].pos < -1) {
+			col = i;
+			break;
+		}
+	}
+	if (col < 0) {
+		for (int i = 0; i < r; i++) {
+			if (c->cols[i].pos < -1) {
+				col = i;
+				break;
+			}
+		}
+	}
+	/* set typical values */
+	if (col >= 0) {
+		c->cols[col].pid = pid;
+		c->cols[col].pos = -1;
+		c->cols[col].ticks = 0;
+		c->cols[col].speed = 10;
+	}
+	return col;
 }
 
 static int handle_event(void *ctx, void *data, size_t data_sz)
@@ -125,20 +136,20 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 
 	/* if column for pid exists, re-use that */
 	col = find_column(ctx, e->pid);
-	if (col < 0) {
-		/* if no matching PID, (try to) create a new column */
-		col = pick_column(c);
-		if (col < 0) return 0;
-
-		c->cols[col].pos = -1;
-		c->cols[col].ticks = 0;
-		c->cols[col].pid = e->pid;
-	}
+	if (col < 0) return 0;
 
 	/* these fields describe the process and are updated on exec */
 	c->cols[col].text = strdup(e->comm);
 	c->cols[col].len = strlen(e->comm);
 	c->cols[col].color = (e->exit_event) ? CC_EXIT : CC_EXEC;
+
+	/* exit event => adjust speed based on lifetime */
+	if (e->exit_event) {
+		double x = e->duration_ns ;
+		x /= x + (1000 * 1000000ULL);
+		x = x * 10;
+		c->cols[col].speed = (int)x;
+	}
 
 	return 0;
 }
@@ -187,7 +198,7 @@ void update_display(struct context *ctx) {
 
 		/* tick for update */
 		col->ticks ++;
-		if (col->ticks < 2) continue;
+		if (col->ticks < col->speed) continue;
 		col->ticks = 0;
 		col->pos ++;
 		if (col->pos >= ctx->nrows + col->len) {
@@ -277,7 +288,7 @@ int main(int argc, char **argv)
 
 		update_display(&ctx);
 		refresh();
-		napms(50);
+		napms(25);
 	}
 	endwin();
 
