@@ -6,6 +6,9 @@
 #include <time.h>
 #include <sys/resource.h>
 #include <bpf/libbpf.h>
+#include <sys/syscall.h>
+#include <linux/perf_event.h>
+#include <unistd.h>
 #include "bootstrap.h"
 #include "bootstrap.skel.h"
 #include <ncurses.h>
@@ -150,7 +153,6 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		x = x * 10;
 		c->cols[col].speed = (int)x;
 	}
-
 	return 0;
 }
 
@@ -189,6 +191,36 @@ void setup_display(struct context *ctx) {
 	}
 }
 
+void update_speeds(const struct bpf_map *map, struct context *ctx) {
+	int error;
+	const int ncpus = libbpf_num_possible_cpus();
+
+	for (int col = 0; col < ctx->ncols; col++) {
+		if (ctx->cols[col].pos < -1) continue;
+		if (ctx->cols[col].color != CC_EXEC) continue;
+
+		const pid_t pid = ctx->cols[col].pid;
+
+		/* read counter and sum across cpus */
+		/* atomically delete reading, so the count measures intervals only */
+		__u64 counts[ncpus];
+		__u64 count = 0;
+		error = bpf_map__lookup_and_delete_elem(map, &pid, sizeof(pid), &counts, sizeof(counts), 0);
+		if (error < 0) {
+			continue;
+		}
+		for (int cpu = 0; cpu < ncpus; cpu++) {
+			count += counts[cpu];
+		}
+
+		/* set speed with arbitrary formula */
+		double x = count / 10000000;
+		x = 1 / (1+x);
+		x *= 10;
+		ctx->cols[col].speed = (int)x;
+	}
+}
+
 void update_display(struct context *ctx) {
 	for (int x = 0; x < ctx->ncols; x++) {
 		struct column *col = &ctx->cols[x];
@@ -214,6 +246,37 @@ void update_display(struct context *ctx) {
 		mvaddch(col->pos - col->len, x, ' ');
 		attroff(COLOR_PAIR(col->color));
 	}
+}
+
+int setup_perf_events(const struct bpf_map *map) {
+	struct perf_event_attr attr = {
+		.type = PERF_TYPE_HARDWARE,
+		.size = sizeof(struct perf_event_attr),
+		.config = PERF_COUNT_HW_CPU_CYCLES,
+	};
+
+	int ncpus = libbpf_num_possible_cpus();
+	if (ncpus < 0) {
+		return -1;
+	}
+
+	for (int cpu = 0; cpu < ncpus; cpu++) {
+		/* open perf event fd */
+		int fd = syscall(SYS_perf_event_open, &attr, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+		if (fd < 0) {
+			fprintf(stderr, "Can't open perf event for cpu %d: %s\n", cpu, strerror(errno));
+			return -1;
+		}
+
+		/* put in map */
+		int rc = bpf_map__update_elem(map, &cpu, sizeof(cpu), &fd, sizeof(fd), BPF_ANY);
+		if (rc < 0) {
+			fprintf(stderr, "Can't update perf map for cpu %d: %s\n", cpu, strerror(errno));
+			return -1;
+		}
+	}
+
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -254,6 +317,13 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
+	/* Set up perf events */
+	err = setup_perf_events(skel->maps.perf);
+	if (err) {
+		fprintf(stderr, "Failed to open perf events\n");
+		goto cleanup;
+	}
+
 	/* Attach tracepoints */
 	err = bootstrap_bpf__attach(skel);
 	if (err) {
@@ -286,6 +356,7 @@ int main(int argc, char **argv)
 			break;
 		}
 
+		update_speeds(skel->maps.counts_delta, &ctx);
 		update_display(&ctx);
 		refresh();
 		napms(25);
