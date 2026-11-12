@@ -22,7 +22,7 @@ CFLAGS := -g -Wall
 LDFLAGS := -lncurses
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
 
-APPS = bootstrap
+APPS = bootstrap cpugraph
 
 # Get Clang's default includes on this system. We'll explicitly add these dirs
 # to the includes list when compiling with `-target bpf` because otherwise some
