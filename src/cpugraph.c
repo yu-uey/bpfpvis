@@ -173,17 +173,35 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	/* Main loop */
-	const struct timespec wait = {
-		.tv_sec = 1,
-		.tv_nsec = 0,
-	};
-	while (!exiting) {
+	/* Read start time for accurate intervals */
+	struct timespec wait_until;
+	err = clock_gettime(CLOCK_MONOTONIC, &wait_until);
+	if (err) {
+		fprintf(stderr, "Failed to wait: %s\n", strerror(errno));
+		goto cleanup;
+	}
 
-		nanosleep(&wait, NULL);
+	/* Main loop */
+	while (!exiting) {
+		err = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wait_until, NULL);
+		if (err == EINTR) {
+			continue;
+		}
+		if (err) {
+			fprintf(stderr, "Failed to sleep: %s\n", strerror(err));
+			goto cleanup;
+		}
+
 		err = sample(skel->maps.counts_pid);
 		if (err) {
 			goto cleanup;
+		}
+
+		/* Wait accurately, in case we want rolling averages later */
+		wait_until.tv_nsec += 2000 * 1000000L;
+		while (wait_until.tv_nsec >= 1000000000L) {
+			wait_until.tv_nsec -= 1000000000L;
+			wait_until.tv_sec += 1;
 		}
 	}
 
