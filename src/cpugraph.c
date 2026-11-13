@@ -9,6 +9,7 @@
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
 #include <unistd.h>
+#include "cpugraph.h"
 #include "cpugraph.skel.h"
 
 static struct env {
@@ -63,30 +64,37 @@ static void sig_handler(int sig)
 	exiting = true;
 }
 
-void sample(const struct bpf_map *map) {
-	int error;
+int sample(const struct bpf_map *map) {
+	int err;
 	const int ncpus = libbpf_num_possible_cpus();
 
-	pid_t pid;
+	struct pd_key key;
 	void *prev = NULL;
 
-	while (bpf_map__get_next_key(map, prev, &pid, sizeof(pid)) == 0) {
-		prev = &pid;
+	while (err = bpf_map__get_next_key(map, prev, &key, sizeof(key)), err == 0) {
+		prev = &key;
 
 		/* read counter and sum across cpus */
-		/* atomically delete reading, so the count measures intervals only */
-		__u64 counts[ncpus];
-		__u64 count = 0;
-		error = bpf_map__lookup_and_delete_elem(map, &pid, sizeof(pid), &counts, sizeof(counts), 0);
-		if (error < 0) {
+		/* atomically delete reading to measure within the interval only */
+		struct pd_value percpu[ncpus];
+		struct pd_value agg;
+		err = bpf_map__lookup_and_delete_elem(map, &key, sizeof(key), &percpu, sizeof(percpu), 0);
+		if (err < 0) {
+			fprintf(stderr, "Lookup elem: %s\n", strerror(-err));
 			continue;
 		}
 		for (int cpu = 0; cpu < ncpus; cpu++) {
-			count += counts[cpu];
+			agg.cycles += percpu[cpu].cycles;
 		}
 
-		printf("%d: %lld\n", pid, count);
+		printf("%d (%d): %lld\n", key.tgid, key.ptgid, agg.cycles);
 	}
+	if (err != -ENOENT) {
+		fprintf(stderr, "Failed to get next key: %s\n", strerror(-err));
+		return -1;
+	}
+
+	return 0;
 }
 
 int setup_perf_events(const struct bpf_map *map) {
@@ -171,9 +179,12 @@ int main(int argc, char **argv)
 		.tv_nsec = 0,
 	};
 	while (!exiting) {
-		sample(skel->maps.counts_pid);
 
 		nanosleep(&wait, NULL);
+		err = sample(skel->maps.counts_pid);
+		if (err) {
+			goto cleanup;
+		}
 	}
 
 cleanup:

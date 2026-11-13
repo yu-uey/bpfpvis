@@ -4,6 +4,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+#include "cpugraph.h"
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
@@ -23,45 +24,58 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
 	__uint(max_entries, 8192);
-	__type(key, __u32);
-	__type(value, __u64);
+	__type(key, struct pd_key);
+	__type(value, struct pd_value);
 } counts_pid SEC(".maps");
 
 
 SEC("tp_btf/sched_switch")
 int BPF_PROG(handle_switch, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state) {
 	int error;
+	const __u32 zero = 0;
 	struct bpf_perf_event_value buf;
 	__u64 *count_last;
-	__u64 *count_pid;
 	__u64 delta;
-	pid_t pid;
-	const __u32 zero = 0;
 
-	pid = prev->tgid;
+	struct pd_key key;
+	struct pd_value *value;
 
 	error = bpf_perf_event_read_value(&perf, BPF_F_CURRENT_CPU, &buf, sizeof(buf));
 	if (error)
 		return 0;
 
 	/* calculate counter deltas for prev process */
-	/* because delta is a percpu array, we update normally */
+	/* delta is a percpu array with one item: it starts with value=0 at key=0 */
 	count_last = bpf_map_lookup_elem(&counts_last, &zero);
-	if (!count_last)
-		return 0;
 
-	if (*count_last) {
+	/* This should never happen, but is needed for the verifier */
+	if (count_last == NULL) {
+		return 0;
+	}
+
+	/* Skip the first run, when counts_last[0] is unset (0) */
+	if (*count_last != 0) {
 		delta = buf.counter - *count_last;
 
-		/* update or set counter */
-		count_pid = bpf_map_lookup_elem(&counts_pid, &pid);
-		if (count_pid) {
-			*count_pid += delta;
+		/* update or set counter for prev process */
+		key.tgid = prev->tgid;
+		key.ptgid = prev->real_parent->tgid;
+
+		value = bpf_map_lookup_elem(&counts_pid, &key);
+
+		if (value != NULL) {
+			/* percpu map can safely be updated from the pointer */
+			value->cycles += delta;
+
 		} else {
-			bpf_map_update_elem(&counts_pid, &pid, &delta, BPF_ANY);
+			struct pd_value new_val = {
+				.cycles = delta,
+			};
+			bpf_map_update_elem(&counts_pid, &key, &new_val, BPF_ANY);
+			/* ignore errors; we still want to update the counts_last entry */
 		}
 	}
 
-	/* update last counter value */
+	/* always update count_last value */
 	*count_last = buf.counter;
 }
