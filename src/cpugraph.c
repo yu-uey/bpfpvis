@@ -65,6 +65,64 @@ static void sig_handler(int sig)
 	exiting = true;
 }
 
+/* simple tree implementation */
+struct ptree_node {
+	struct pd_key key;
+	struct pd_value value;
+	struct ptree_node *parent;
+	struct ptree_node **children;
+	size_t n_children;
+	size_t cap_children;
+};
+/* allocates a new root node with the inserted data */
+struct ptree_node *ptree_new(struct pd_key key, struct pd_value value) {
+	struct ptree_node *node = malloc(sizeof(*node));
+	if (node == NULL) {
+		fprintf(stderr, "Failed malloc node: %s\n", strerror(errno));
+		return NULL;
+	}
+	node->key = key;
+	node->value = value;
+	node->parent = NULL;
+	node->children = NULL;
+	node->n_children = 0;
+	node->cap_children = 0;
+	return node;
+}
+void ptree_free(struct ptree_node *node, bool recursive) {
+	if (node == NULL) {
+		return;
+	}
+	if (recursive) {
+		for (int i = 0; i < node->n_children; i++) {
+			ptree_free(node->children[i], true);
+		}
+	}
+	free(node->children);
+	free(node);
+}
+int ptree_parent(struct ptree_node *parent, struct ptree_node *child) {
+	/* no reparent if already parent */
+	/* ignore NULL parent because this tree only implements insert */
+	if (!parent || !child || parent == child->parent) {
+		return 0;
+	}
+	/* reallocate array (0 => 1, n => 2n)*/
+	if (!parent->children || parent->n_children >= parent->cap_children) {
+		parent->cap_children = (parent->cap_children) ? parent->cap_children << 1 : 1;
+		parent->children = reallocarray(parent->children, parent->cap_children, sizeof(*parent->children));
+		if (parent->children == NULL) {
+			fprintf(stderr, "Failed realloc: %s\n", strerror(errno));
+			return -1;
+		}
+	}
+	/* insert child */
+	parent->children[parent->n_children] = child;
+	child->parent = parent;
+	parent->n_children++;
+	return 0;
+}
+
 /* Simple hash map implementation
  * - Insert-only, no delete (empty instead)
  * - Assumes all inserted values > 0 */
@@ -74,12 +132,12 @@ enum {
 };
 static struct {
 	struct pd_key keys[PMAP_SIZE];
-	struct pd_value values[PMAP_SIZE];
-	struct pd_value zero_value;
+	struct ptree_node *values[PMAP_SIZE];
+	struct ptree_node *zero_value;
 } pmap;
 /* return pointer to where element is or should be set, and NULL if full
  * Uses linear probing with fibonacci hash */
-static struct pd_value *pmap_get(struct pd_key *key) {
+static struct ptree_node **pmap_get(struct pd_key *key) {
 	__u32 hash;
 	__u32 i;
 
@@ -92,7 +150,7 @@ static struct pd_value *pmap_get(struct pd_key *key) {
 	for (int j = 0; j < PMAP_SIZE; j++) {
 		i = (hash + j) & (PMAP_SIZE - 1);
 
-		/* a zero key means the slot is empty */
+		/* a 0 key entry means empty, since real key=0 is handled above */
 		if (pmap.keys[i].tgid == 0) {
 			pmap.keys[i].tgid = key->tgid;
 		}
@@ -108,10 +166,12 @@ static void pmap_clear() {
 	memset(pmap.values, 0, sizeof(pmap.values));
 }
 
+
 int sample(const struct bpf_map *counter_map, const struct bpf_map *parent_map) {
 	int err = 0;
 	bool done = false;
 
+	ptree_free(pmap.zero_value, true); /* leak orphans */
 	pmap_clear();
 
 	const int ncpus = libbpf_num_possible_cpus();
@@ -169,25 +229,42 @@ int sample(const struct bpf_map *counter_map, const struct bpf_map *parent_map) 
 			}
 
 			/* walk up ancestry and add to their counters too */
-			struct pd_key prev;
-			struct pd_key next = *key;
+			struct pd_key prev_key;
+			struct pd_key next_key = *key;
+			struct ptree_node *prev_node = NULL;
+			struct ptree_node **next_node = NULL; /* pointer inside map for writing */
 			while (true) {
-				struct pd_value *record = pmap_get(&next);
+				/* fetch node from map. NULL means no space */
+				next_node = pmap_get(&next_key);
+				if (next_node == NULL) {
+					fprintf(stderr, "Failed userspace map lookup\n");
+					continue;
+				}
+				/* if unset in map, allocate new node */
+				if (*next_node == NULL) {
+					*next_node = ptree_new(next_key, agg);
+					if (*next_node == NULL) {
+						continue;
+					}
+				}
+				/* add prev_node as a child to this new parent */
+				ptree_parent(*next_node, prev_node);
+
+				struct pd_value *record = &(*next_node)->value;
 				record->cycles += agg.cycles;
 
-				printf("%d-", next.tgid);
-
 				/* skip last lookup */
-				if (next.tgid == 0) {
+				if (next_key.tgid == 0) {
 					break;
 				}
 
-				/* find next parent */
-				prev = next;
+				/* find next_key parent */
+				prev_key = next_key;
+				prev_node = *next_node;
 				err = bpf_map__lookup_elem(
 					parent_map,
-					&prev, sizeof(prev),
-					&next, sizeof(next),
+					&prev_key, sizeof(prev_key),
+					&next_key, sizeof(next_key),
 					0
 				);
 				if (err < 0) {
@@ -195,14 +272,11 @@ int sample(const struct bpf_map *counter_map, const struct bpf_map *parent_map) 
 					continue;
 				}
 			}
-			printf("- %lld\n", agg.cycles);
 		}
 
 	}
 
-	struct pd_key key = { .tgid = 0 };
-	struct pd_value *val = pmap_get(&key);
-	printf("%d: %lld\n", key.tgid, val->cycles);
+	printf("%d: %lld\n", 0, pmap.zero_value->value.cycles);
 
 	err = 0;
 
