@@ -65,9 +65,54 @@ static void sig_handler(int sig)
 	exiting = true;
 }
 
+/* Simple hash map implementation
+ * - Insert-only, no delete (empty instead)
+ * - Assumes all inserted values > 0 */
+enum {
+	PMAP_POW = 13,
+	PMAP_SIZE = (size_t)1 << PMAP_POW,
+};
+static struct {
+	struct pd_key keys[PMAP_SIZE];
+	struct pd_value values[PMAP_SIZE];
+	struct pd_value zero_value;
+} pmap;
+/* return pointer to where element is or should be set, and NULL if full
+ * Uses linear probing with fibonacci hash */
+static struct pd_value *pmap_get(struct pd_key *key) {
+	__u32 hash;
+	__u32 i;
+
+	if (key->tgid == 0) {
+		return &pmap.zero_value;
+	}
+
+	hash = (key->tgid * 0x9E3779B97F4A7C15ULL) >> (64 - PMAP_POW);
+
+	for (int j = 0; j < PMAP_SIZE; j++) {
+		i = (hash + j) & (PMAP_SIZE - 1);
+
+		/* a zero key means the slot is empty */
+		if (pmap.keys[i].tgid == 0) {
+			pmap.keys[i].tgid = key->tgid;
+		}
+		if (pmap.keys[i].tgid == key->tgid) {
+			return &pmap.values[i];
+		}
+	}
+	return NULL;
+}
+static void pmap_clear() {
+	memset(&pmap.zero_value, 0, sizeof(pmap.zero_value));
+	memset(pmap.keys, 0, sizeof(pmap.keys));
+	memset(pmap.values, 0, sizeof(pmap.values));
+}
+
 int sample(const struct bpf_map *counter_map, const struct bpf_map *parent_map) {
 	int err = 0;
 	bool done = false;
+
+	pmap_clear();
 
 	const int ncpus = libbpf_num_possible_cpus();
 	const __u32 batch_size = 2048;
@@ -117,23 +162,47 @@ int sample(const struct bpf_map *counter_map, const struct bpf_map *parent_map) 
 			struct pd_value (*percpu)[ncpus] = &values[i];
 
 			/* read counter and sum across cpus */
-			struct pd_value agg;
+			struct pd_value agg = {0};
 
 			for (int cpu = 0; cpu < ncpus; cpu++) {
 				agg.cycles += percpu[cpu]->cycles;
 			}
 
-			__u32 parent;
-			err = bpf_map__lookup_elem(parent_map, &key->tgid, sizeof(key->tgid), &parent, sizeof(parent), 0);
-			if (err < 0) {
-				fprintf(stderr, "Lookup parent: %s\n", strerror(-err));
-				continue;
-			}
+			/* walk up ancestry and add to their counters too */
+			struct pd_key prev;
+			struct pd_key next = *key;
+			while (true) {
+				struct pd_value *record = pmap_get(&next);
+				record->cycles += agg.cycles;
 
-			printf("%d (%d): %lld\n", key->tgid, parent, agg.cycles);
+				printf("%d-", next.tgid);
+
+				/* skip last lookup */
+				if (next.tgid == 0) {
+					break;
+				}
+
+				/* find next parent */
+				prev = next;
+				err = bpf_map__lookup_elem(
+					parent_map,
+					&prev, sizeof(prev),
+					&next, sizeof(next),
+					0
+				);
+				if (err < 0) {
+					fprintf(stderr, "Lookup parent: %s\n", strerror(-err));
+					continue;
+				}
+			}
+			printf("- %lld\n", agg.cycles);
 		}
 
 	}
+
+	struct pd_key key = { .tgid = 0 };
+	struct pd_value *val = pmap_get(&key);
+	printf("%d: %lld\n", key.tgid, val->cycles);
 
 	err = 0;
 
