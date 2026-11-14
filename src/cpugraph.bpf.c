@@ -28,6 +28,29 @@ struct {
 	__type(value, struct pd_value);
 } counts_pid SEC(".maps");
 
+/* PID -> PPID */
+/* Use LRU so exited processes are still likely to keep their entries */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u32);
+	__type(value, __u32);
+} last_parent SEC(".maps");
+
+SEC("iter/task")
+int iter_for_parents(struct bpf_iter__task *ctx) {
+	int err;
+	struct task_struct *task = ctx->task;
+	__u32 key;
+	__u32 value;
+	if (task == NULL) {
+		return 0; /* ignore last (empty) iteration */
+	}
+	key = task->tgid;
+	value = task->real_parent->tgid;
+	bpf_map_update_elem(&last_parent, &key, &value, BPF_ANY);
+	return 0;
+}
 
 SEC("tp_btf/sched_switch")
 int BPF_PROG(handle_switch, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state) {
@@ -39,6 +62,9 @@ int BPF_PROG(handle_switch, bool preempt, struct task_struct *prev, struct task_
 
 	struct pd_key key;
 	struct pd_value *value;
+
+	__u32 *parent_ptr;
+	__u32 parent_val;
 
 	error = bpf_perf_event_read_value(&perf, BPF_F_CURRENT_CPU, &buf, sizeof(buf));
 	if (error)
@@ -59,7 +85,6 @@ int BPF_PROG(handle_switch, bool preempt, struct task_struct *prev, struct task_
 
 		/* update or set counter for prev process */
 		key.tgid = prev->tgid;
-		key.ptgid = prev->real_parent->tgid;
 
 		value = bpf_map_lookup_elem(&counts_pid, &key);
 
@@ -73,6 +98,13 @@ int BPF_PROG(handle_switch, bool preempt, struct task_struct *prev, struct task_
 			};
 			bpf_map_update_elem(&counts_pid, &key, &new_val, BPF_ANY);
 			/* ignore errors; we still want to update the counts_last entry */
+		}
+
+		/* make sure last_parent is up-to-date */
+		parent_ptr = bpf_map_lookup_elem(&last_parent, &key.tgid);
+		if (parent_ptr == NULL || *parent_ptr != prev->real_parent->tgid) {
+			parent_val = prev->real_parent->tgid;
+			bpf_map_update_elem(&last_parent, &key.tgid, &parent_val, BPF_ANY);
 		}
 	}
 

@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <sys/resource.h>
+#include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
@@ -64,21 +65,21 @@ static void sig_handler(int sig)
 	exiting = true;
 }
 
-int sample(const struct bpf_map *map) {
+int sample(const struct bpf_map *counter_map, const struct bpf_map *parent_map) {
 	int err;
 	const int ncpus = libbpf_num_possible_cpus();
 
 	struct pd_key key;
 	void *prev = NULL;
 
-	while (err = bpf_map__get_next_key(map, prev, &key, sizeof(key)), err == 0) {
+	while (err = bpf_map__get_next_key(counter_map, prev, &key, sizeof(key)), err == 0) {
 		prev = &key;
 
 		/* read counter and sum across cpus */
 		/* atomically delete reading to measure within the interval only */
 		struct pd_value percpu[ncpus];
 		struct pd_value agg;
-		err = bpf_map__lookup_and_delete_elem(map, &key, sizeof(key), &percpu, sizeof(percpu), 0);
+		err = bpf_map__lookup_and_delete_elem(counter_map, &key, sizeof(key), &percpu, sizeof(percpu), 0);
 		if (err < 0) {
 			fprintf(stderr, "Lookup elem: %s\n", strerror(-err));
 			continue;
@@ -87,7 +88,14 @@ int sample(const struct bpf_map *map) {
 			agg.cycles += percpu[cpu].cycles;
 		}
 
-		printf("%d (%d): %lld\n", key.tgid, key.ptgid, agg.cycles);
+		__u32 parent;
+		err = bpf_map__lookup_elem(parent_map, &key.tgid, sizeof(key.tgid), &parent, sizeof(parent), 0);
+		if (err < 0) {
+			fprintf(stderr, "Lookup parent: %s\n", strerror(-err));
+			continue;
+		}
+
+		printf("%d (%d): %lld\n", key.tgid, parent, agg.cycles);
 	}
 	if (err != -ENOENT) {
 		fprintf(stderr, "Failed to get next key: %s\n", strerror(-err));
@@ -131,6 +139,8 @@ int setup_perf_events(const struct bpf_map *map) {
 int main(int argc, char **argv)
 {
 	struct cpugraph_bpf *skel;
+	int iter_fd = -1;
+	char iter_buf; /* iterator does not write to seq_file, so buf is ceremonial */
 	int err;
 
 	/* Parse command line arguments */
@@ -173,6 +183,23 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
+	/* Run iterator to set initial parents */
+	iter_fd = bpf_iter_create(bpf_link__fd(skel->links.iter_for_parents));
+	if (iter_fd < 0) {
+		fprintf(stderr, "Failed to create iterator\n");
+		err = -1;
+		goto cleanup;
+	}
+	while (true) {
+		int n = read(iter_fd, &iter_buf, sizeof(iter_buf));
+		if (n == 0) break;
+		if (n < 0 && errno != EINTR && errno != EAGAIN) {
+			fprintf(stderr, "Failed to read iterator\n");
+			err = -1;
+			goto cleanup;
+		}
+	}
+
 	/* Read start time for accurate intervals */
 	struct timespec wait_until;
 	err = clock_gettime(CLOCK_MONOTONIC, &wait_until);
@@ -192,7 +219,7 @@ int main(int argc, char **argv)
 			goto cleanup;
 		}
 
-		err = sample(skel->maps.counts_pid);
+		err = sample(skel->maps.counts_pid, skel->maps.last_parent);
 		if (err) {
 			goto cleanup;
 		}
@@ -207,6 +234,9 @@ int main(int argc, char **argv)
 
 cleanup:
 	/* Clean up */
+	if (iter_fd >= 0) {
+		close(iter_fd);
+	}
 	cpugraph_bpf__destroy(skel);
 
 	return err < 0 ? -err : 0;
