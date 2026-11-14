@@ -66,43 +66,82 @@ static void sig_handler(int sig)
 }
 
 int sample(const struct bpf_map *counter_map, const struct bpf_map *parent_map) {
-	int err;
+	int err = 0;
+	bool done = false;
+
 	const int ncpus = libbpf_num_possible_cpus();
+	const __u32 batch_size = 2048;
+	struct pd_value (*values)[ncpus];
+	struct pd_key *keys;
 
-	struct pd_key key;
-	void *prev = NULL;
-
-	while (err = bpf_map__get_next_key(counter_map, prev, &key, sizeof(key)), err == 0) {
-		prev = &key;
-
-		/* read counter and sum across cpus */
-		/* atomically delete reading to measure within the interval only */
-		struct pd_value percpu[ncpus];
-		struct pd_value agg;
-		err = bpf_map__lookup_and_delete_elem(counter_map, &key, sizeof(key), &percpu, sizeof(percpu), 0);
-		if (err < 0) {
-			fprintf(stderr, "Lookup elem: %s\n", strerror(-err));
-			continue;
-		}
-		for (int cpu = 0; cpu < ncpus; cpu++) {
-			agg.cycles += percpu[cpu].cycles;
-		}
-
-		__u32 parent;
-		err = bpf_map__lookup_elem(parent_map, &key.tgid, sizeof(key.tgid), &parent, sizeof(parent), 0);
-		if (err < 0) {
-			fprintf(stderr, "Lookup parent: %s\n", strerror(-err));
-			continue;
-		}
-
-		printf("%d (%d): %lld\n", key.tgid, parent, agg.cycles);
+	keys = malloc(batch_size * sizeof(*keys));
+	if (keys == NULL) {
+		fprintf(stderr, "Failed to allocate batch keys: %s\n", strerror(errno));
+		err = -1;
+		goto cleanup;
 	}
-	if (err != -ENOENT) {
-		fprintf(stderr, "Failed to get next key: %s\n", strerror(-err));
-		return -1;
+	values = malloc(batch_size * ncpus * sizeof(*values));
+	if (values == NULL) {
+		fprintf(stderr, "Failed to allocate batch values: %s\n", strerror(errno));
+		err = -1;
+		goto cleanup;
 	}
 
-	return 0;
+	int counter_map_fd = bpf_map__fd(counter_map);
+	void *batch_pos = NULL;
+	__u32 next_batch;
+	__u32 count;
+	LIBBPF_OPTS(bpf_map_batch_opts, batch_opts); /* no extra flags */
+
+	while (!done) {
+		count = batch_size;
+		err = bpf_map_lookup_and_delete_batch(
+			counter_map_fd,
+			batch_pos, &next_batch,
+			keys, values, 
+			&count,
+			&batch_opts
+		);
+		if (err == -ENOENT) {
+			done = true;
+		} else if (err < 0) {
+			/* if err != EFAULT, count elements were copied successfully. We ignore them */
+			fprintf(stderr, "Failed lookup: %s\n", strerror(errno));
+			goto cleanup;
+		}
+		batch_pos = &next_batch;
+
+		/* process each entry in the batch */
+		for (__u32 i = 0; i < count; i++) {
+			struct pd_key *key = &keys[i];
+			struct pd_value (*percpu)[ncpus] = &values[i];
+
+			/* read counter and sum across cpus */
+			struct pd_value agg;
+
+			for (int cpu = 0; cpu < ncpus; cpu++) {
+				agg.cycles += percpu[cpu]->cycles;
+			}
+
+			__u32 parent;
+			err = bpf_map__lookup_elem(parent_map, &key->tgid, sizeof(key->tgid), &parent, sizeof(parent), 0);
+			if (err < 0) {
+				fprintf(stderr, "Lookup parent: %s\n", strerror(-err));
+				continue;
+			}
+
+			printf("%d (%d): %lld\n", key->tgid, parent, agg.cycles);
+		}
+
+	}
+
+	err = 0;
+
+cleanup:
+	free(keys);
+	free(values);
+
+	return (err < 0) ? -1 : 0;
 }
 
 int setup_perf_events(const struct bpf_map *map) {
