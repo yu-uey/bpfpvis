@@ -10,6 +10,7 @@
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
 #include <unistd.h>
+#include <ncurses.h>
 #include "cpugraph.h"
 #include "cpugraph.skel.h"
 
@@ -242,7 +243,8 @@ int sample(const struct bpf_map *counter_map, const struct bpf_map *parent_map) 
 				}
 				/* if unset in map, allocate new node */
 				if (*next_node == NULL) {
-					*next_node = ptree_new(next_key, agg);
+					struct pd_value z = {0};
+					*next_node = ptree_new(next_key, z);
 					if (*next_node == NULL) {
 						continue;
 					}
@@ -276,8 +278,6 @@ int sample(const struct bpf_map *counter_map, const struct bpf_map *parent_map) 
 
 	}
 
-	printf("%d: %lld\n", 0, pmap.zero_value->value.cycles);
-
 	err = 0;
 
 cleanup:
@@ -285,6 +285,54 @@ cleanup:
 	free(values);
 
 	return (err < 0) ? -1 : 0;
+}
+
+void setup_display() {
+	initscr();
+	noecho();
+	cbreak();
+	curs_set(0);
+	if (has_colors()) {
+		start_color();
+		use_default_colors();
+		init_pair(1, COLOR_BLUE, -1);
+	}
+}
+void draw_recurse(int row, int col, int width, struct ptree_node *node, bool color) {
+	if (width <= 0) {
+		return;
+	}
+	/* draw this row full width */
+	attron(COLOR_PAIR(1) | (color ? A_BOLD : A_DIM));
+	move(row, col);
+	for (int i = 0; i < width; i++) {
+		addch(ACS_BLOCK);
+	}
+	attroff(COLOR_PAIR(1) | (color ? A_BOLD : A_DIM));
+
+	/* recurse children */
+	unsigned long long offset = 0;
+	bool child_color = false;
+	for (int i = 0; i < node->n_children; i++) {
+		struct ptree_node *child = node->children[i];
+		int child_width = width * child->value.cycles / node->value.cycles;
+		int child_offset = width * offset / node->value.cycles;
+		if (child_width > 0) {
+			draw_recurse(row+1, col+child_offset, child_width, child, child_color);
+			child_color = !child_color;
+		}
+		offset += child->value.cycles;
+	}
+}
+/* Displays the data living in pmap */
+void visualize() {
+	int maxx;
+	maxx = getmaxx(stdscr);
+	erase();
+	if (pmap.zero_value != NULL) {
+		draw_recurse(0, 0, maxx, pmap.zero_value, false);
+	}
+	refresh();
 }
 
 int setup_perf_events(const struct bpf_map *map) {
@@ -390,6 +438,8 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
+	setup_display();
+
 	/* Main loop */
 	while (!exiting) {
 		err = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wait_until, NULL);
@@ -405,6 +455,7 @@ int main(int argc, char **argv)
 		if (err) {
 			goto cleanup;
 		}
+		visualize();
 
 		/* Wait accurately, in case we want rolling averages later */
 		wait_until.tv_nsec += 2000 * 1000000L;
@@ -416,6 +467,7 @@ int main(int argc, char **argv)
 
 cleanup:
 	/* Clean up */
+	endwin();
 	if (iter_fd >= 0) {
 		close(iter_fd);
 	}
