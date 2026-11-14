@@ -159,13 +159,13 @@ int sample(const struct bpf_map *counter_map, const struct bpf_map *parent_map) 
 		/* process each entry in the batch */
 		for (__u32 i = 0; i < count; i++) {
 			struct pd_key *key = &keys[i];
-			struct pd_value (*percpu)[ncpus] = &values[i];
+			struct pd_value *percpu = values[i];
 
 			/* read counter and sum across cpus */
 			struct pd_value agg = {0};
 
 			for (int cpu = 0; cpu < ncpus; cpu++) {
-				agg.cycles += percpu[cpu]->cycles;
+				agg.cycles += percpu[cpu].cycles;
 			}
 
 			/* walk up ancestry and add to their counters too */
