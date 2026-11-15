@@ -52,11 +52,23 @@ int iter_for_parents(struct bpf_iter__task *ctx) {
 	struct pd_key key;
 
 	if (task == NULL) {
-		return 0; /* ignore last (empty) iteration */
+		/* setup task 0 after everything else to avoid map lookup errors */
+		key.tgid = 0;
+		struct pd_extra extra = {
+			.parent = key,
+			.comm = "swapper",
+			.uid = 0, .gid = 0,
+		};
+		bpf_map_update_elem(&task_extra, &key, &extra, BPF_ANY);
+		return 0;
+	}
+
+	/* only process thread leaders, ie once per userspace PID (tgid) */
+	if (task->tgid != task->pid) {
+		return 0;
 	}
 
 	key.tgid = task->tgid;
-
 	init_extra(task, &key);
 
 	return 0;
@@ -117,7 +129,6 @@ int BPF_PROG(handle_switch, bool preempt, struct task_struct *prev, struct task_
 			extra_ptr->parent.tgid = prev->real_parent->tgid;
 		}
 	}
-
 	/* always update count_last value */
 	*count_last = buf.counter;
 
