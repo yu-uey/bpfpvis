@@ -1,10 +1,20 @@
-# BPF Process "Visualizer"
+# BPF Process Visualizer
 
-Code based on [libbpf-bootstrap](https://github.com/libbpf/libbpf-bootstrap). The process exec and exit bpf tracepoint code is largely unchanged (though ported to BTF).
+A simple program to display some live process information, with a BPF backend. Code based on [libbpf-bootstrap](https://github.com/libbpf/libbpf-bootstrap).
 
-Inspired by the [CMatrix](https://github.com/abishekvashok/cmatrix) screensaver. Plenty of full-fledged tools for execsnoop already exist, so this project does not try to be a useful tool. For the most part, this is a just-for-fun piece of code to play around with BPF.
+### `cpugraph.c`
+Produces a flame/icicle graph of processes, arranged hierarchically by parent (PPID). It uses the `PERF_COUNT_HW_CPU_CYCLES` perf event to track CPU cycles and attributes them to processes at the `tp_btf/sched_switch` tracepoint. A `iter/task` iterator is used to initialize this hierarchy and include processes that may not go on the CPU.
 
-Processes `tp_btf/sched_process_exec` and `tp_btf/sched_process_exit` events using a ring buffer. CPU cycle counts are computed on the `tp_btf/sched_switch` tracepoint, reading from the `PERF_COUNT_HW_CPU_CYCLES` perf event. The userspace program takes this information from a per-CPU hash map on an interval.
+The ncurses display is slightly interactive: the spacebar pauses the display, and allows the user to recursively "zoom in" on a process, selecting from its children using arrow keys. Backspace zooms out / unpauses.
+
+Future plans may include:
+- Command-line options to adjust sampling interval
+- Visual continuity between frames for the same process, with easing or color/symbol hash to allow the process to make clear it is the same process in both frames.
+
+
+### `bootstrap.c`
+Inspired by [CMatrix](https://github.com/abishekvashok/cmatrix). Tracks `tp_btf/sched_process_exec` and `tp_btf/sched_process_exit` events using a ring buffer, and outputs them as "digital rain" in ncurses. The bpf tracepoint code is largely unchanged from libbpf-bootstrap (though modified to use BTF).
+
 
 ## Dependencies
 
@@ -33,5 +43,5 @@ Makefile build:
 $ git submodule update --init --recursive       # check out libbpf
 $ cd src
 $ make
-$ sudo ./bootstrap
+$ sudo ./cpugraph
 ```
