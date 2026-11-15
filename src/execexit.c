@@ -6,8 +6,8 @@
 #include <time.h>
 #include <sys/resource.h>
 #include <bpf/libbpf.h>
-#include "bootstrap.h"
-#include "bootstrap.skel.h"
+#include "execexit.h"
+#include "execexit.skel.h"
 #include <ncurses.h>
 
 static struct env {
@@ -219,7 +219,7 @@ void update_display(struct context *ctx) {
 int main(int argc, char **argv)
 {
 	struct ring_buffer *rb = NULL;
-	struct bootstrap_bpf *skel;
+	struct execexit_bpf *skel;
 	int err;
 
 	/* state for display */
@@ -238,7 +238,7 @@ int main(int argc, char **argv)
 	signal(SIGTERM, sig_handler);
 
 	/* Load and verify BPF application */
-	skel = bootstrap_bpf__open();
+	skel = execexit_bpf__open();
 	if (!skel) {
 		fprintf(stderr, "Failed to open and load BPF skeleton\n");
 		return 1;
@@ -248,14 +248,14 @@ int main(int argc, char **argv)
 	skel->rodata->min_duration_ns = env.min_duration_ms * 1000000ULL;
 
 	/* Load & verify BPF programs */
-	err = bootstrap_bpf__load(skel);
+	err = execexit_bpf__load(skel);
 	if (err) {
 		fprintf(stderr, "Failed to load and verify BPF skeleton\n");
 		goto cleanup;
 	}
 
 	/* Attach tracepoints */
-	err = bootstrap_bpf__attach(skel);
+	err = execexit_bpf__attach(skel);
 	if (err) {
 		fprintf(stderr, "Failed to attach BPF skeleton\n");
 		goto cleanup;
@@ -295,7 +295,7 @@ int main(int argc, char **argv)
 cleanup:
 	/* Clean up */
 	ring_buffer__free(rb);
-	bootstrap_bpf__destroy(skel);
+	execexit_bpf__destroy(skel);
 
 	return err < 0 ? -err : 0;
 }

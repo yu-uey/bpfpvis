@@ -14,7 +14,7 @@ Future plans may include:
 - Visual continuity between frames for the same process, with easing or color/symbol hash to allow the process to make clear it is the same process in both frames.
 
 
-### `bootstrap.c`
+### `execexit.c`
 Inspired by [CMatrix](https://github.com/abishekvashok/cmatrix). Tracks `tp_btf/sched_process_exec` and `tp_btf/sched_process_exit` events using a ring buffer, and outputs them as "digital rain" in ncurses. The bpf tracepoint code is largely unchanged from libbpf-bootstrap (though modified to use BTF).
 
 
