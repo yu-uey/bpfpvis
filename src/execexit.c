@@ -73,6 +73,7 @@ enum colcolor {
 };
 struct column {
 	size_t len;
+	size_t oldlen;
 	char *text;
 	int pos;
 	int ticks;
@@ -142,6 +143,10 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	c->cols[col].text = strdup(e->comm);
 	c->cols[col].len = strlen(e->comm);
 	c->cols[col].color = (e->exit_event) ? CC_EXIT : CC_EXEC;
+	/* oldlen = max(new len, previous len) */
+	if (c->cols[col].oldlen < c->cols[col].len ) {
+		c->cols[col].oldlen = c->cols[col].len;
+	}
 
 	/* exit event => adjust speed based on lifetime */
 	if (e->exit_event) {
@@ -157,6 +162,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 void init_col(struct column *col) {
 	col->text = NULL;
 	col->len = 0;
+	col->oldlen = 0;
 	col->pos = -2;
 	col->ticks = 0;
 	col->color = CC_DEFAULT;
@@ -210,8 +216,12 @@ void update_display(struct context *ctx) {
 		attron(COLOR_PAIR(col->color));
 		/* add bottom */
 		mvaddch(col->pos, x, col->text[col->pos % col->len]);
-		/* decay top */
-		mvaddch(col->pos - col->len, x, ' ');
+		/* decay top, decaying extra if column was previously longer */
+		if (col->oldlen > col->len) {
+			mvaddch(col->pos - col->oldlen, x, ' ');
+			col->oldlen --;
+		}
+		mvaddch(col->pos - col->oldlen, x, ' ');
 		attroff(COLOR_PAIR(col->color));
 	}
 }
