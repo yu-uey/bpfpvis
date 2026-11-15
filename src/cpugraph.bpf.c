@@ -28,27 +28,37 @@ struct {
 	__type(value, struct pd_value);
 } counts_pid SEC(".maps");
 
-/* PID -> PPID */
 /* Use LRU so exited processes are still likely to keep their entries */
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 8192);
 	__type(key, struct pd_key);
-	__type(value, struct pd_key);
-} last_parent SEC(".maps");
+	__type(value, struct pd_extra);
+} task_extra SEC(".maps");
+
+static void __always_inline init_extra(struct task_struct *task, struct pd_key *key) {
+	struct pd_extra extra;
+	extra.parent.tgid = task->real_parent->tgid;
+	bpf_probe_read_kernel_str(extra.comm, sizeof(extra.comm), task->comm);
+	extra.uid = task->real_cred->uid.val;
+	extra.gid = task->real_cred->gid.val;
+	bpf_map_update_elem(&task_extra, key, &extra, BPF_ANY);
+}
 
 SEC("iter/task")
 int iter_for_parents(struct bpf_iter__task *ctx) {
 	int err;
 	struct task_struct *task = ctx->task;
 	struct pd_key key;
-	struct pd_key value;
+
 	if (task == NULL) {
 		return 0; /* ignore last (empty) iteration */
 	}
+
 	key.tgid = task->tgid;
-	value.tgid = task->real_parent->tgid;
-	bpf_map_update_elem(&last_parent, &key, &value, BPF_ANY);
+
+	init_extra(task, &key);
+
 	return 0;
 }
 
@@ -62,9 +72,6 @@ int BPF_PROG(handle_switch, bool preempt, struct task_struct *prev, struct task_
 
 	struct pd_key key;
 	struct pd_value *value;
-
-	struct pd_key *parent_ptr;
-	struct pd_key parent_val;
 
 	error = bpf_perf_event_read_value(&perf, BPF_F_CURRENT_CPU, &buf, sizeof(buf));
 	if (error)
@@ -100,14 +107,32 @@ int BPF_PROG(handle_switch, bool preempt, struct task_struct *prev, struct task_
 			/* ignore errors; we still want to update the counts_last entry */
 		}
 
-		/* make sure last_parent is up-to-date */
-		parent_ptr = bpf_map_lookup_elem(&last_parent, &key.tgid);
-		if (parent_ptr == NULL || parent_ptr->tgid != prev->real_parent->tgid) {
-			parent_val.tgid = prev->real_parent->tgid;
-			bpf_map_update_elem(&last_parent, &key.tgid, &parent_val, BPF_ANY);
+		/* make sure parent is up-to-date */
+		struct pd_extra *extra_ptr;
+		extra_ptr = bpf_map_lookup_elem(&task_extra, &key.tgid);
+		if (extra_ptr == NULL) {
+			/* should not happen because iter/task or exec would have recorded this */
+			init_extra(prev, &key);
+		} else if (extra_ptr->parent.tgid != prev->real_parent->tgid) {
+			extra_ptr->parent.tgid = prev->real_parent->tgid;
 		}
 	}
 
 	/* always update count_last value */
 	*count_last = buf.counter;
+
+	return 0;
+}
+
+SEC("tp_btf/sched_process_exec")
+int BPF_PROG(handle_exec, struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm) {
+	struct pd_key key;
+	struct pd_extra extra;
+
+	key.tgid = p->tgid;
+
+	/* copy info */
+	init_extra(p, &key);
+
+	return 0;
 }

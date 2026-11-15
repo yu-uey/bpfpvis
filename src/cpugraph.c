@@ -70,13 +70,14 @@ static void sig_handler(int sig)
 struct ptree_node {
 	struct pd_key key;
 	struct pd_value value;
+	struct pd_extra extra;
 	struct ptree_node *parent;
 	struct ptree_node **children;
 	size_t n_children;
 	size_t cap_children;
 };
 /* allocates a new root node with the inserted data */
-struct ptree_node *ptree_new(struct pd_key key, struct pd_value value) {
+struct ptree_node *ptree_new(struct pd_key key, struct pd_value value, struct pd_extra extra) {
 	struct ptree_node *node = malloc(sizeof(*node));
 	if (node == NULL) {
 		fprintf(stderr, "Failed malloc node: %s\n", strerror(errno));
@@ -84,6 +85,7 @@ struct ptree_node *ptree_new(struct pd_key key, struct pd_value value) {
 	}
 	node->key = key;
 	node->value = value;
+	node->extra = extra;
 	node->parent = NULL;
 	node->children = NULL;
 	node->n_children = 0;
@@ -168,7 +170,7 @@ static void pmap_clear() {
 }
 
 
-int sample(const struct bpf_map *counter_map, const struct bpf_map *parent_map) {
+int sample(const struct bpf_map *counter_map, const struct bpf_map *extra_map) {
 	int err = 0;
 	bool done = false;
 
@@ -230,11 +232,23 @@ int sample(const struct bpf_map *counter_map, const struct bpf_map *parent_map) 
 			}
 
 			/* walk up ancestry and add to their counters too */
-			struct pd_key prev_key;
 			struct pd_key next_key = *key;
+			struct pd_extra extra;
 			struct ptree_node *prev_node = NULL;
 			struct ptree_node **next_node = NULL; /* pointer inside map for writing */
 			while (true) {
+				/* lookup process information, including parent */
+				err = bpf_map__lookup_elem(
+					extra_map,
+					&next_key, sizeof(next_key),
+					&extra, sizeof(extra),
+					0
+				);
+				if (err < 0) {
+					fprintf(stderr, "Lookup extra %d: %s\n", next_key.tgid, strerror(-err));
+					continue;
+				}
+
 				/* fetch node from map. NULL means no space */
 				next_node = pmap_get(&next_key);
 				if (next_node == NULL) {
@@ -244,38 +258,26 @@ int sample(const struct bpf_map *counter_map, const struct bpf_map *parent_map) 
 				/* if unset in map, allocate new node */
 				if (*next_node == NULL) {
 					struct pd_value z = {0};
-					*next_node = ptree_new(next_key, z);
+					*next_node = ptree_new(next_key, z, extra);
 					if (*next_node == NULL) {
 						continue;
 					}
 				}
 				/* add prev_node as a child to this new parent */
+				/* returns silently for first iteration, when prev_node=NULL*/
 				ptree_parent(*next_node, prev_node);
 
 				struct pd_value *record = &(*next_node)->value;
 				record->cycles += agg.cycles;
 
-				/* skip last lookup */
+				/* continue to parent, or terminate if we just saw PID=0 */
 				if (next_key.tgid == 0) {
 					break;
 				}
-
-				/* find next_key parent */
-				prev_key = next_key;
+				next_key = extra.parent;
 				prev_node = *next_node;
-				err = bpf_map__lookup_elem(
-					parent_map,
-					&prev_key, sizeof(prev_key),
-					&next_key, sizeof(next_key),
-					0
-				);
-				if (err < 0) {
-					fprintf(stderr, "Lookup parent: %s\n", strerror(-err));
-					continue;
-				}
 			}
 		}
-
 	}
 
 	err = 0;
@@ -333,10 +335,26 @@ void draw_recurse(int row, int col, int width, struct ptree_node *node, bool col
 /* Displays the data living in pmap */
 void visualize(struct ptree_node *root, struct ptree_node *highlight) {
 	int maxx;
+	int y = 0;
 	maxx = getmaxx(stdscr);
 	erase();
 	if (root != NULL) {
-		draw_recurse(1, 0, maxx, root, false, highlight);
+		mvprintw(
+			y++, 0,
+			"Children of PID %d (%d:%d): %s",
+			root->key.tgid,
+			root->extra.uid, root->extra.gid,
+			root->extra.comm
+		);
+		if (highlight != NULL) {
+			mvprintw(
+				y++, 0,
+				"Select child? %d: %s",
+				highlight->key.tgid,
+				highlight->extra.comm
+			);
+		}
+		draw_recurse(y, 0, maxx, root, false, highlight);
 	}
 	refresh();
 }
@@ -503,7 +521,7 @@ int main(int argc, char **argv)
 			enter_pause(pmap.zero_value);
 		}
 
-		err = sample(skel->maps.counts_pid, skel->maps.last_parent);
+		err = sample(skel->maps.counts_pid, skel->maps.task_extra);
 		if (err) {
 			goto cleanup;
 		}
