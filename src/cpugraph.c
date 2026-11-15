@@ -292,23 +292,29 @@ void setup_display() {
 	noecho();
 	cbreak();
 	curs_set(0);
+	keypad(stdscr, TRUE);
+	nodelay(stdscr, TRUE);
 	if (has_colors()) {
 		start_color();
 		use_default_colors();
 		init_pair(1, COLOR_BLUE, -1);
+		init_pair(2, COLOR_RED, -1);
 	}
 }
-void draw_recurse(int row, int col, int width, struct ptree_node *node, bool color) {
+void draw_recurse(int row, int col, int width, struct ptree_node *node, bool color, struct ptree_node *highlight) {
 	if (width <= 0) {
 		return;
 	}
 	/* draw this row full width */
-	attron(COLOR_PAIR(1) | (color ? A_BOLD : A_DIM));
+	attr_t attr = COLOR_PAIR(1)
+	              | (color ? A_BOLD : A_DIM)
+	              | (node == highlight ? A_BLINK : 0);
+	attron(attr);
 	move(row, col);
 	for (int i = 0; i < width; i++) {
 		addch(ACS_BLOCK);
 	}
-	attroff(COLOR_PAIR(1) | (color ? A_BOLD : A_DIM));
+	attroff(attr);
 
 	/* recurse children */
 	unsigned long long offset = 0;
@@ -318,19 +324,19 @@ void draw_recurse(int row, int col, int width, struct ptree_node *node, bool col
 		int child_width = width * child->value.cycles / node->value.cycles;
 		int child_offset = width * offset / node->value.cycles;
 		if (child_width > 0) {
-			draw_recurse(row+1, col+child_offset, child_width, child, child_color);
+			draw_recurse(row+1, col+child_offset, child_width, child, child_color, highlight);
 			child_color = !child_color;
 		}
 		offset += child->value.cycles;
 	}
 }
 /* Displays the data living in pmap */
-void visualize() {
+void visualize(struct ptree_node *root, struct ptree_node *highlight) {
 	int maxx;
 	maxx = getmaxx(stdscr);
 	erase();
-	if (pmap.zero_value != NULL) {
-		draw_recurse(0, 0, maxx, pmap.zero_value, false);
+	if (root != NULL) {
+		draw_recurse(1, 0, maxx, root, false, highlight);
 	}
 	refresh();
 }
@@ -364,6 +370,38 @@ int setup_perf_events(const struct bpf_map *map) {
 	}
 
 	return 0;
+}
+
+void enter_pause(struct ptree_node *root) {
+	if (root == NULL) return;
+
+	int pos = 0;
+
+	while (true) {
+		switch (getch()) {
+		case KEY_LEFT:
+			if (pos > 0)
+				pos--;
+			break;
+		case KEY_RIGHT:
+			if (pos < root->n_children - 1)
+				pos++;
+			break;
+		case ' ':
+			/* pause on current selection */
+			if (pos < root->n_children) {
+				enter_pause(root->children[pos]);
+			}
+			break;
+		case 127:
+		case '\b':
+		case KEY_BACKSPACE:
+			/* unpause */
+			return;
+		}
+
+		visualize(root, (pos < root->n_children ? root->children[pos] : NULL));
+	}
 }
 
 int main(int argc, char **argv)
@@ -451,14 +489,28 @@ int main(int argc, char **argv)
 			goto cleanup;
 		}
 
+		/* catch keys before updating */
+		/* all keys emptied to prevent unexpected response */
+		int ch;
+		bool pause;
+		while (ch = getch(), ch != ERR) {
+			if (ch == ' ') {
+				pause = true;
+			}
+		}
+		if (pause) {
+			pause = false;
+			enter_pause(pmap.zero_value);
+		}
+
 		err = sample(skel->maps.counts_pid, skel->maps.last_parent);
 		if (err) {
 			goto cleanup;
 		}
-		visualize();
+		visualize(pmap.zero_value, NULL);
 
 		/* Wait accurately, in case we want rolling averages later */
-		wait_until.tv_nsec += 2000 * 1000000L;
+		wait_until.tv_nsec += 500 * 1000000L;
 		while (wait_until.tv_nsec >= 1000000000L) {
 			wait_until.tv_nsec -= 1000000000L;
 			wait_until.tv_sec += 1;
