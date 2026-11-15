@@ -7,6 +7,8 @@ Produces a flame/icicle graph of processes, arranged hierarchically by parent (P
 
 The ncurses display is slightly interactive: the spacebar pauses the display, and allows the user to recursively "zoom in" on a process, selecting from its children using arrow keys. Backspace zooms out / unpauses.
 
+![Demo Screenshot](./screenshot-cpugraph.png)
+
 Future plans may include:
 - Command-line options to adjust sampling interval
 - Visual continuity between frames for the same process, with easing or color/symbol hash to allow the process to make clear it is the same process in both frames.
